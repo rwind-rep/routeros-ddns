@@ -1,0 +1,364 @@
+{
+	#定义脚本名(如果开启IPV6定时执行必须修改此值与你设置值相同)
+	:local scriptname "DDNS_Update"
+	#PPPoE 名称
+	#(需要修改)获取拨号接口名称
+	:local pppoe "PPPoE"
+
+	#需要更新DNS网站和对应token
+	#书写格式：单个DNS商 {{token="";dnsapi="DNS商"}} 多个域名商 {{token="";dnsapi="DNS商"}}
+	#腾讯DNS更新支持国内和国际，书写格式：{{token="腾讯token：199237,a9d9d0812f72d";dnsapi="DNS商：dnspod.cn 或 dnspod.com"}}
+	#(需要修改)DNS列表
+	:local dnslist {
+		{token="";dnsapi="dnspod.cn"};
+		{token="";dnsapi="dnspod.com"};
+		{token={email="";key=""};dnsapi="cloudflare.com"}
+	}
+
+	#(需要修改)更新域名列表
+	:local domains {"example.com";"example.me";"example.io"}
+
+	#(需要修改)子域名(支持多个子域名)
+	:local subdomains {"ip";"api";"www";"*";"@"}
+
+	#需要更新ipv6 地址后缀，前缀自动获取接口,后缀提取方法：如fe80::5eb9:1ff:fe95:1e70/64 提取后：5eb9:1ff:fe95:1e70
+	#(需要修改) ipv6后缀
+	:local ipv6address "9c06:7eff:fe9b:c208"
+
+	#ipv6 定时器开关(因为电信IPV6间隔1个小时就会更改)
+	#(需要修改) ipv6定时器
+	:local ipv6scheduler false
+
+	#ipv6 是否有效
+	:local isipv6 false
+	#拼接后的IPV6地址
+	:local ispipv6
+
+	#判断接口是否有效
+	:if ([/interface/find name=$pppoe] = "") do={:log error ("没有指定[$pppoe]接口退出");:error ("没有指定接口退出")}
+	#获取pppoe 拨号ipv4
+	:local ispipv4 [/ip address get [/ip address find interface=$pppoe] address]
+	:if ([:len $ispipv4] =0 ) do={:log error ("获取IPV4失败,无法获取IP地址");:error ("未获取到IPV4")}
+	:set ispipv4 [:pick $ispipv4 0 [:find $ispipv4 "/"]]
+
+	#获取PPPoE ipv6 prefix
+	:local ispipv6prefix [/ipv6 dhcp-client get [/ipv6 dhcp-client find interface=$pppoe] prefix]
+	#ipv6剩余有效时间
+	:local ipv6expires
+	:if ([:len $ispipv6prefix]!=0) do={
+		:set ipv6expires [:totime [:pick $ispipv6prefix ([:find $ispipv6prefix ","]+2) [:len $ispipv6prefix] ] ]
+		:set ispipv6prefix [:pick $ispipv6prefix 0 ([:find $ispipv6prefix "/"]-1)]
+		:set isipv6 true
+		:set ispipv6 ("$ispipv6prefix"."$ipv6address")
+	}
+
+	#定时执行函数
+	:local schedulerFunc do={
+		:if ($ipv6scheduler) do={
+			:log debug ("打开定时执行脚本")
+			:local isscheduler [/system scheduler find name="Dns_Scheduler"]
+			:local schedulertime ([/system clock get time]+$ipv6expires+00:00:10)
+			:local schedulerdate [/system clock get date]
+			:if ($isscheduler ="") do={
+				[/system scheduler add name="Dns_Scheduler" start-time=$schedulertime  on-event=":execute \"$scriptname\"" start-date=$schedulerdate interval=0]
+			} else={
+				:if ($schedulertime>1d) do={
+					:set schedulertime ($schedulertime-24:00:00)
+					/system scheduler set [/system scheduler find name="Dns_Scheduler"]  start-time=startup interval=$schedulertime
+				} else={
+					/system scheduler set [/system scheduler find name="Dns_Scheduler"]  start-time=$schedulertime start-date=$schedulerdate interval=0
+				}
+			}
+		} else={
+			:if ($isscheduler !="") do={
+				:log debug ("删除已有DNS更新定时器")
+				[/system scheduler remove [/system scheduler find name="Dns_Scheduler"]]
+			}
+		}
+	}
+
+	#腾讯DNS函数
+	:local dnspod do={
+
+		 #腾讯域名列表函数
+		 :local dnspoddomains do={
+			:log debug ("腾讯DNS列表获取$dnsapiurl")
+			:local apidomains
+			:local domainsdata
+			:local status
+			do {
+				:set domainsdata ([/tool fetch url="$dnsapiurl/Domain.List" http-data="login_token=$token&format=json" as-value output=user]->"data")
+				#验证API是否可用
+				:set status ([:pick $domainsdata ([:find $domainsdata "\"code\":"]+8) [:find $domainsdata "\","] ])
+			} on-error={:set status false}
+			:if ($status!=1) do={:log error ("获取腾讯域名列表错误代码:$status");:return $apidomains}
+			do {
+				:set domainsdata [:pick $domainsdata [:find $domainsdata "\"domains\":"] ([:len $domainsdata]-1)]
+				:while ([:len $domainsdata]!=0) do={
+					:local domaindata ([:pick $domainsdata [:find $domainsdata "{"] ([:find $domainsdata "}"]+1)])
+					#获取域名ID
+					:local domainid ([:pick $domainsdata ([:find $domainsdata "\"id\":"]+5) [:find $domainsdata ",\""]])
+					#获取域名
+					:local domainName ([:pick $domainsdata ([:find $domainsdata "\"name\":"]+8) [:find $domainsdata "\",\"grade_level"]])
+					#截断剩余
+					:set domainsdata ([:pick $domainsdata ([:find $domainsdata "}"]+2) [:len $domainsdata]])
+					:set apidomains (apidomains,$domainName)
+				}
+			} on-error={:log error ("解析腾讯DNS域名列表参数错误! 请联系开发者");:error "dns script quit"}
+			:return $apidomains
+		 }
+
+		 #腾讯域名记录列表
+		 :local dnspodrecord do={
+			#执行读取记录列表
+			:local execrecord do={
+				:local recordlist
+				:local recordsdata
+				:local status
+				do {
+					:set recordsdata ([/tool fetch url="$dnsapiurl/Record.List" http-data="login_token=$token&format=json&domain=$domain" as-value output=user]->"data")
+					#验证API是否可用
+					:set status ([:pick $recordsdata ([:find $recordsdata "\"code\":"]+8) [:find $recordsdata "\","]])
+				} on-error={:set status false}
+				:if ($status!=1) do={:log error ("获取腾讯域名记录列表错误代码:$status");:return $recordlist}
+				do {
+					:set recordsdata [:pick $recordsdata [:find $recordsdata "\"records\":"] ([:len $recordsdata]-1)]
+					:while ([:len $recordsdata]!=0) do={
+						:local recordobj
+						:local recorddata ([:pick $recordsdata [:find $recordsdata "{"] ([:find $recordsdata "}"]+1) ])
+						:set ($recordobj->"domain") $domain
+						:set ($recordobj->"id") [:pick $recorddata ([:find $recorddata "\"id\":\""]+6) [:find $recorddata "\",\"ttl"]]
+						:set ($recordobj->"ip") [:pick $recorddata ([:find $recorddata "\"value\":\""]+9) [:find $recorddata "\",\"en"]]
+						:set ($recordobj->"name") [:pick $recorddata ([:find $recorddata "\"name\":\""]+8) [:find $recorddata "\",\"line"]]
+						:if ($dnsapi = "dnspod.cn") do={
+							:set ($recordobj->"type") [:pick $recorddata ([:find $recorddata "\"type\":\""]+8) [:find $recorddata "\",\"weight"]]
+						} else={
+							:set ($recordobj->"type") [:pick $recorddata ([:find $recorddata "\"type\":\""]+8) [:find $recorddata "\",\"remark"]]
+						}
+						:local type ($recordobj->"type")
+						:local name ($recordobj->"name")
+						:if ($type = "A" || $type = "AAAA") do={
+							:foreach subdomain in=$subdomains do={
+								:if ($subdomain = $name) do={
+									:set ($recordlist->[:len $recordlist]) $recordobj
+								}
+							}
+						}
+						#截断剩余域名
+						:set recordsdata ([:pick $recordsdata ([:find $recordsdata "}"]+2) [:len $recordsdata]])
+					}
+				} on-error={:log error ("解析腾讯DNS记录参数错误!请联系开发者");:error "dns script quit"}
+				:return $recordlist
+			}
+
+			:local recordlist
+			:foreach apidomain in=$apidomains do={
+				:foreach domain in=$domains do={
+					:if ($apidomain = $domain) do={
+						:delay 1s
+						#获取DNS记录列表
+						:local apirecords [$execrecord token=$token dnsapiurl=$dnsapiurl domain=$apidomain subdomains=$subdomains dnsapi=$dnsapi]
+						:if ([:len apirecords] !=0) do={:set recordlist (recordlist,$apirecords)}
+					}
+				}
+			}
+			:return $recordlist
+		 }
+
+		 #腾讯域名修改
+		 :local dnspodmodify do={
+			:delay 1s
+			:local domain ($records->"domain")
+			#设置需要更新值
+			:local value
+			:local subdomain ($records->"name")
+			:local ip ($records->"ip")
+			:local recordid ($records->"id")
+			:local type ($records->"type")
+			:if ($type = "A") do={:if ($ip != $ipv4) do={:set value $ipv4} else={:log debug ("域名:$subdomain.$domain不需要更新IPV4")}}
+			:if ($type = "AAAA") do={:if ($ip != $ipv6) do={:if ($isipv6) do={:set value $ipv6}} else={:log debug ("域名:$subdomain.$domain不需要更新IPV6")}}
+			:if ([:len $value]!=0) do={
+				:log info ("更新域名: $subdomain.$domain 源IP: $ip 更改值: $value")
+				:local modifydata ([/tool fetch url="$dnsapiurl/Record.Modify" http-data="login_token=$token&format=json&domain=$domain&sub_domain=$subdomain&record_type=$type&record_id=$recordid&record_line_id=0&value=$value" as-value output=user]->"data")
+				#验证API是否可用
+				:local status ([:pick $modifydata ([:find $modifydata "\"code\":"]+8) [:find $modifydata "\","]])
+				if ($status!=1) do={:log error ("修改腾讯DNS记录错误代码:$status");:return false}
+			}
+			:return true
+		 }
+		 #dnspod更新域名操作执行
+		 :local dnsapiurl
+		 :if ($dnsapi = "dnspod.cn") do={:set dnsapiurl "https://dnsapi.cn"} else={:set dnsapiurl "https://api.dnspod.com"}
+		 #调用获取域名列表函数
+		 :local apidomains [$dnspoddomains token=$token dnsapiurl=$dnsapiurl]
+		 :if ([:len $apidomains]=0) do={:log warning ("腾讯域名列表为空");:return false}
+		 #获取需要更新DNS记录列表函数
+		 :local apirecords [$dnspodrecord token=$token dnsapiurl=$dnsapiurl  apidomains=$apidomains domains=$domains subdomains=$subdomains dnsapi=$dnsapi]
+		 :if ([:len $apirecords]=0) do={:log warning ("腾讯域名记录为空");:return false}
+		 :foreach records in=$apirecords do={
+			:delay 1s
+			:local ismodify [$dnspodmodify token=$token dnsapiurl=$dnsapiurl records=$records ipv4=$ipv4 ipv6=$ipv6 isipv6=$isipv6]
+			:if (!$ismodify) do={:log error ($records)}
+		 }
+		 :return true
+	}
+
+	#CF函数
+	:local cfFunc do={
+		#认证Headers
+		:local authHeaders do={
+			:local email ($token->"email")
+			:local key ($token->"key")
+			:local headers "Content-Type: application/json"
+			:set headers ($headers.",X-Auth-Email:".$email)
+			:set headers ($headers.",X-Auth-Key:".$key)
+			:return $headers
+		}
+		:local auth [$authHeaders token=$token]
+		:local apiurl "https://api.cloudflare.com/client/v4"
+
+		#获取CF域名列表
+		:local cfdomains do={
+			:log debug ("CF DNS列表获取$apiurl")
+			:local domainlist
+			:local domainsdata
+			:local status
+			do {
+				:set domainsdata ([/tool fetch url="$apiurl/zones" http-header-field="$auth" as-value output=user]->"data")
+				#验证API是否可用
+				:set status ([:pick $domainsdata ([:find $domainsdata "\"success\":"]+10) [:find $domainsdata ",\"error"]])
+			} on-error={:set status false}
+			:if (!$status) do={:log error ("获取CF域名列表错误");:return $domainlist}
+			do {
+				:set domainsdata [:pick $domainsdata [:find $domainsdata "\"result\":"] ([:find $domainsdata "}]"]+2)]
+				:while ([:len $domainsdata]!=0) do={
+					:local domainobj
+					:local domaindata ([:pick $domainsdata [:find $domainsdata "{"] ([:find $domainsdata "}}"]+2)])
+					#获取域名ID
+					:set ($domainobj->"domainId") [:pick $domaindata ([:find $domaindata "\"id\":"]+6) [:find $domaindata "\",\"name"]]
+					#获取域名
+					:set ($domainobj->"domainName") [:pick $domaindata ([:find $domaindata "\"name\":"]+8) [:find $domaindata "\",\"status"]]
+					:set ($domainlist->[:len $domainlist]) $domainobj
+					#截断剩余
+					:set domainsdata ([:pick $domainsdata ([:find $domainsdata "}}"]+3) [:len $domainsdata]])
+				}
+			} on-error={:log error ("解析CF域名列表参数失败! 请联系开发者");:error "dns script quit"}
+			:return $domainlist
+		}
+		#获取CF域名记录列表
+		:local cfrecords do={
+			:local execrecord do={
+				:local recordlist
+				:local recordsdata
+				:local status
+				:local domainId ($domaindata->"domainId")
+				:local domainName ($domaindata->"domainName")
+				do {
+					:set recordsdata ([/tool fetch url="$apiurl/zones/$domainId/dns_records?status=active" http-header-field=$auth as-value output=user]->"data")
+					#验证API是否可用
+					:set status ([:pick $recordsdata ([:find $recordsdata "\"success\":"]+10) [:find $recordsdata ",\"error"] ])
+				} on-error={:set status false}
+				:if (!$status) do={:log error ("获取CF域名记录列表错误");:return $recordlist}
+				do {
+					:set recordsdata [:pick $recordsdata [:find $recordsdata "\"result\":"] ([:find $recordsdata "}]"]+2)]
+					:while ([:len $recordsdata]!=0) do={
+						:local recordobj
+						:local recorddata ([:pick $recordsdata [:find $recordsdata "{"] ([:find $recordsdata "\"modified_on\""])])
+						:set ($recordobj->"subDomainId") [:pick $recorddata ([:find $recorddata "\"id\":"]+6) [:find $recorddata "\",\"zone_id"]]
+						:set ($recordobj->"subName") [:pick $recorddata ([:find $recorddata "\"name\":"]+8) [:find $recorddata "\",\"type"]]
+						:set ($recordobj->"type") [:pick $recorddata ([:find $recorddata "\"type\":"]+8) [:find $recorddata "\",\"content"]]
+						:set ($recordobj->"value") [:pick $recorddata ([:find $recorddata "\"content\":"]+11) [:find $recorddata "\",\"proxiable"]]
+						:set ($recordobj->"proxied") [:pick $recorddata ([:find $recorddata "\"proxied\":"]+10) [:find $recorddata ",\"ttl"]]
+						:set ($recordobj->"domainId") $domainId
+						:set ($recordobj->"domain") $domainName
+						:local subType ($recordobj->"type")
+						:local subName ($recordobj->"subName")
+						:if ($subType ="A" || $subType="AAAA") do={
+							:foreach subdomain in=$subdomains do={
+								:if ($subName =("$subdomain"."."."$domainName")) do={:set ($recordlist->[:len $recordlist]) $recordobj}
+							}
+						}
+						#截断剩余域名
+						:local start [:find $recordsdata ",{\"id\""]
+						:if ([:len $start]!=0) do={
+							:set recordsdata ([:pick $recordsdata ([:find $recordsdata ",{\"id\""]+1) [:len $recordsdata]])
+						} else={:set recordsdata}
+					}
+				} on-error={:log error ("解析CF记录列表参数错误! 请联系开发者");:error "dns script quit"}
+				:return $recordlist
+			}
+			:local recordlist
+			:foreach apidomain in=$apidomains do={
+				:local domainName ($apidomain->"domainName")
+				:foreach domain in=$domains do={
+					:if ($domainName =$domain) do={
+						:delay 1s
+						#获取DNS记录列表
+						:local apirecords [$execrecord apiurl=$apiurl auth=$auth domaindata=$apidomain subdomains=$subdomains]
+						:if ([:len apirecords] !=0) do={:set recordlist (recordlist,$apirecords)}
+					}
+				}
+			}
+			:return $recordlist
+		}
+		#修改CF域名记录
+		:local cfmodify do={
+			:local status
+			:local value
+			:local subType ($record->"type")
+			:local ip ($record->"value")
+			:local domainId ($record->"domainId")
+			:local domain ($record->"domain")
+			:local subdomain ($record->"subName")
+			:local subDomainId ($record->"subDomainId")
+			:local proxied ($record->"proxied")
+			:if ($subType ="A") do={:if ($ip !=$ipv4) do={:set value $ipv4} else={:log debug ("域名:$subdomain不需要更新IPV4")}}
+			:if ($subType ="AAAA") do={:if ($ip !=$ipv6) do={:if ($isipv6) do={:set value $ipv6}} else={:log debug ("域名:$subdomain不需要更新IPV6")}}
+			:if ([:len $value]!=0) do={
+				do {
+					:log info ("更新域名: $subdomain 源IP: $ip 更改值: $value")
+					:local apijson "{\"type\":\"$subType\",\"name\":\"$subdomain\",\"content\":\"$value\",\"proxied\":$proxied,\"ttl\":1}"
+					:local modifydata ([/tool fetch http-method="put" url="$apiurl/zones/$domainId/dns_records/$subDomainId" http-data=$apijson http-header-field=$auth as-value output=user]->"data")
+					#验证API是否可用
+					:set status [:pick $modifydata ([:find $modifydata "\"success\":"]+10) [:find $modifydata ",\"errors"]]
+				} on-error={:set status false}
+				:if (!$status) do={:log error ("修改CF域名记录错误!");:return status}
+			}
+			:return $status
+		}
+		#执行CF更新操作
+		:local apidomains [$cfdomains apiurl=$apiurl auth=$auth]
+		:if ([:len $apidomains] =0) do={:log error ("获取CF域名列表错误!");:return false}
+		:local apirecords [$cfrecords apiurl=$apiurl auth=$auth apidomains=$apidomains domains=$domains subdomains=$subdomains]
+		:if ([:len $apirecords] =0) do={:return false}
+		:foreach apirecord in=$apirecords do={
+			:delay 1s
+			:local ismodify [$cfmodify apiurl=$apiurl auth=$auth record=$apirecord ipv4=$ipv4 ipv6=$ipv6 isipv6=$isipv6]
+			:if (!$ismodify) do={:log debug ($apirecord)}
+		}
+		:return true
+	}
+
+	#更新域名状态变量
+	:local isdns
+	#开始执行对应域名商更新函数
+	:foreach dns in=$dnslist do={
+		:local dnsapi ($dns->"dnsapi")
+		#腾讯DNS
+		:if ($dnsapi = "dnspod.cn" || $dnsapi = "dnspod.com") do={
+			:log debug ("腾讯DDNS域名$dnsapi更新执行中........")
+			:set isdns [$dnspod token=($dns->"token") dnsapi=$dnsapi domains=$domains subdomains=$subdomains ipv4=$ispipv4 ipv6=$ispipv6 isipv6=$isipv6]
+			:if (!$isdns) do={:log warning ("腾讯DNS更新$dnsapi出现错误")}
+		}
+		#CF DNS
+		:if ($dnsapi = "cloudflare.com") do={
+			:log debug ("CF DNS $dnsapi更新执行中........")
+			:set isdns [$cfFunc token=($dns->"token") dnsapi=$dnsapi domains=$domains subdomains=$subdomains ipv4=$ispipv4 ipv6=$ispipv6 isipv6=$isipv6]
+			:if (!$isdns) do={:log warning ("CF DNS更新$dnsapi出现错误")}
+		}
+	}
+	#执行定时函数
+	do {
+		[$schedulerFunc ipv6scheduler=$ipv6scheduler ipv6expires=$ipv6expires scriptname=$scriptname]
+	} on-error={:log error ("执行定时任务错误")}
+}
