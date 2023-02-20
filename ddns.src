@@ -183,7 +183,7 @@
 				#验证API是否可用
 				:local status ([:pick $modifydata ([:find $modifydata "\"code\":"]+8) [:find $modifydata "\","]])
 				if ($status!=1) do={:log error ("修改腾讯DNS记录错误代码:$status");:return false}
-			}
+			} else={:return true}
 			:return true
 		 }
 		 #dnspod更新域名操作执行
@@ -323,14 +323,14 @@
 					:set status [:pick $modifydata ([:find $modifydata "\"success\":"]+10) [:find $modifydata ",\"errors"]]
 				} on-error={:set status false}
 				:if (!$status) do={:log error ("修改CF域名记录错误!");:return status}
-			}
+			} else={:set status true}
 			:return $status
 		}
 		#执行CF更新操作
 		:local apidomains [$cfdomains apiurl=$apiurl auth=$auth]
 		:if ([:len $apidomains] =0) do={:log error ("获取CF域名列表错误!");:return false}
 		:local apirecords [$cfrecords apiurl=$apiurl auth=$auth apidomains=$apidomains domains=$domains subdomains=$subdomains]
-		:if ([:len $apirecords] =0) do={:return false}
+		:if ([:len $apirecords] =0) do={:return true}
 		:foreach apirecord in=$apirecords do={
 			:delay 1s
 			:local ismodify [$cfmodify apiurl=$apiurl auth=$auth record=$apirecord ipv4=$ipv4 ipv6=$ipv6 isipv6=$isipv6]
